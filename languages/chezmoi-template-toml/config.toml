@@ -1,0 +1,6 @@
+name = "Chezmoi TOML Template"
+grammar = "gotmpl"
+path_suffixes = ["toml.tmpl"]
+tab_size = 2
+hard_tabs = false
+

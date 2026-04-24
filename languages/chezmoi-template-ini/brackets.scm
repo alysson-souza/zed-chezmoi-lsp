@@ -1,0 +1,1 @@
+../chezmoi-template/brackets.scm

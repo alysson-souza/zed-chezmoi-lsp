@@ -1,0 +1,6 @@
+name = "Chezmoi Fish Template"
+grammar = "gotmpl"
+path_suffixes = ["fish.tmpl"]
+tab_size = 4
+hard_tabs = false
+

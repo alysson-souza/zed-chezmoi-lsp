@@ -1,0 +1,29 @@
+id = "chezmoi-lsp"
+name = "Chezmoi Templates"
+description = "Chezmoi template support with configurable host language LSP proxying"
+version = "0.1.0"
+schema_version = 1
+authors = ["Alysson Souza <alysson@ll9.com.br>"]
+repository = "https://github.com/alysson-souza/zed-chezmoi-lsp"
+
+[language_servers.chezmoi-lsp]
+name = "Chezmoi Template LSP"
+languages = [
+  "Chezmoi Template",
+  "Chezmoi INI Template",
+  "Chezmoi JSON Template",
+  "Chezmoi JSONC Template",
+  "Chezmoi Fish Template",
+  "Chezmoi Python Template",
+  "Chezmoi Shell Template",
+  "Chezmoi YAML Template",
+  "Chezmoi TOML Template",
+]
+
+[grammars.gotmpl]
+repository = "https://github.com/ngalaiko/tree-sitter-go-template"
+commit = "aa71f63de226c5592dfbfc1f29949522d7c95fac"
+
+[grammars.ini]
+repository = "https://github.com/justinmk/tree-sitter-ini"
+commit = "e4018b5176132b4f3c5d6e61cea383f42288d0f5"

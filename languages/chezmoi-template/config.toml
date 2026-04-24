@@ -1,0 +1,14 @@
+name = "Chezmoi Template"
+grammar = "gotmpl"
+path_suffixes = ["tmpl", ".chezmoiignore"]
+autoclose_before = " \t\r\n)}]"
+
+brackets = [
+    { start = "{{", end = "}}", close = true, newline = false },
+    { start = "(", end = ")", close = true, newline = false },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["comment", "string"] },
+    { start = "`", end = "`", close = true, newline = false, not_in = ["comment", "string"] },
+]
+
+increase_indent_pattern = "^.*\\{\\{[- ]?\\s*(if|range|with|define|block)\\b.*\\}\\}.*$"
+decrease_indent_pattern = "^\\s*\\{\\{[- ]?\\s*(else|end)\\b.*\\}\\}"

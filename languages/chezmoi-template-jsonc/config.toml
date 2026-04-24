@@ -1,0 +1,6 @@
+name = "Chezmoi JSONC Template"
+grammar = "gotmpl"
+path_suffixes = ["jsonc.tmpl"]
+tab_size = 2
+hard_tabs = false
+

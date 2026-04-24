@@ -1,0 +1,5 @@
+name = "Chezmoi Python Template"
+grammar = "gotmpl"
+path_suffixes = ["py.tmpl", "pyi.tmpl", "mpy.tmpl"]
+tab_size = 4
+hard_tabs = false

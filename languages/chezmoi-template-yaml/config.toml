@@ -1,0 +1,6 @@
+name = "Chezmoi YAML Template"
+grammar = "gotmpl"
+path_suffixes = ["yaml.tmpl", "yml.tmpl"]
+tab_size = 2
+hard_tabs = false
+

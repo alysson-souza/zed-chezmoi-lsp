@@ -1,0 +1,6 @@
+name = "Chezmoi JSON Template"
+grammar = "gotmpl"
+path_suffixes = ["json.tmpl"]
+tab_size = 2
+hard_tabs = false
+

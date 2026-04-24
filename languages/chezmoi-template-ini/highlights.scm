@@ -1,0 +1,1 @@
+../chezmoi-template/highlights.scm

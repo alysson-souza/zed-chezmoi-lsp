@@ -1,0 +1,4 @@
+name = "INI"
+grammar = "ini"
+path_suffixes = ["ini"]
+line_comments = ["; ", "# "]

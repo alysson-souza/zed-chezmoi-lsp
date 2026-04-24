@@ -1,0 +1,5 @@
+name = "Chezmoi INI Template"
+grammar = "gotmpl"
+path_suffixes = ["ini.tmpl"]
+tab_size = 2
+hard_tabs = false
