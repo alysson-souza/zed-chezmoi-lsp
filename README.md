@@ -11,7 +11,8 @@ and configuration files while preserving host-language syntax where possible.
 - Treats `.chezmoiignore` as a Chezmoi template
 - Preserves host-language syntax highlighting for common file types
 - Proxies non-template regions to host language servers when configured
-- Filters diagnostics and semantic tokens that overlap `{{ ... }}` regions
+- Filters host diagnostics that overlap `{{ ... }}` regions
+- Uses tree-sitter injections for syntax colors instead of host LSP semantic tokens
 - Falls back to plain Chezmoi template highlighting for unknown suffixes
 
 ## Supported Host Syntax Wrappers
