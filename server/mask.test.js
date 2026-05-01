@@ -1,6 +1,8 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
@@ -14,10 +16,20 @@ const {
   offsetAtPosition,
   positionAtOffset,
   rangeOverlapsSpans,
-  remapSemanticTokens,
   shouldSuppressHostError,
   templateDiagnostics,
 } = require("./chezmoi-lsp");
+
+function configPath(...parts) {
+  return path.join(__dirname, "..", ...parts);
+}
+
+function readPathSuffixes(configFile) {
+  const config = fs.readFileSync(configFile, "utf8");
+  const match = config.match(/path_suffixes\s*=\s*\[([\s\S]*?)\]/);
+  assert.ok(match, `${configFile} should define path_suffixes`);
+  return [...match[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+}
 
 test("findTemplateSpans finds closed and unclosed template actions", () => {
   const text = "a {{ .chezmoi.os }} b {{ if .x }}";
@@ -52,11 +64,27 @@ test("inferHostKey strips only the final tmpl suffix and chooses longest configu
   });
 
   assert.equal(inferHostKey("file:///dot_config/fish/config.fish.tmpl", hostLanguages), "fish");
+  assert.equal(inferHostKey("file:///tmp/a.json.tmpl", hostLanguages), "json");
   assert.equal(inferHostKey("file:///tmp/settings.json.tmpl", hostLanguages), "json");
   assert.equal(inferHostKey("file:///tmp/example.long.name.tmpl", hostLanguages), "long.name");
   assert.equal(inferHostKey("file:///dot_zshrc.tmpl", hostLanguages), "zshrc");
   assert.equal(inferHostKey("file:///private_dot_zshrc.tmpl", hostLanguages), "zshrc");
   assert.equal(inferHostKey("file:///tmp/README.tmpl", hostLanguages), "*");
+});
+
+test("JSON and JSONC templates use separate wrappers", () => {
+  const jsonSuffixes = readPathSuffixes(configPath("languages", "chezmoi-template-json", "config.toml"));
+  const jsoncSuffixes = readPathSuffixes(configPath("languages", "chezmoi-template-jsonc", "config.toml"));
+
+  assert.deepEqual(jsonSuffixes, ["json.tmpl"]);
+  assert.deepEqual(jsoncSuffixes, ["jsonc.tmpl"]);
+});
+
+test("proxy does not advertise semantic tokens", () => {
+  const server = fs.readFileSync(configPath("server", "chezmoi-lsp.js"), "utf8");
+
+  assert.equal(server.includes("semanticTokensProvider"), false);
+  assert.equal(server.includes("textDocument/semanticTokens/full"), false);
 });
 
 test("hostUriForTemplateUri removes final .tmpl suffix", () => {
@@ -143,30 +171,6 @@ test("filterAndRewriteResponse drops host ranges that overlap template spans", (
         end: { line: 0, character: 32 },
       },
     },
-  ]);
-});
-
-test("remapSemanticTokens drops tokens inside template spans", () => {
-  const text = "a {{ .x }} b";
-  const doc = {
-    text,
-    spans: findTemplateSpans(text),
-  };
-  const hostLegend = {
-    tokenTypes: ["keyword", "variable"],
-    tokenModifiers: ["declaration"],
-  };
-  const result = remapSemanticTokens({
-    data: [
-      0, 0, 1, 0, 0,
-      0, 3, 2, 1, 0,
-      0, 9, 1, 1, 0,
-    ],
-  }, doc, hostLegend);
-
-  assert.deepEqual(result.data, [
-    0, 0, 1, 15, 0,
-    0, 12, 1, 8, 0,
   ]);
 });
 

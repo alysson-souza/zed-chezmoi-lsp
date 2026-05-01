@@ -30,45 +30,6 @@ const InsertTextFormat = {
   Snippet: 2,
 };
 
-const COMMON_SEMANTIC_TOKEN_TYPES = [
-  "namespace",
-  "type",
-  "class",
-  "enum",
-  "interface",
-  "struct",
-  "typeParameter",
-  "parameter",
-  "variable",
-  "property",
-  "enumMember",
-  "event",
-  "function",
-  "method",
-  "macro",
-  "keyword",
-  "modifier",
-  "comment",
-  "string",
-  "number",
-  "regexp",
-  "operator",
-  "decorator",
-];
-
-const COMMON_SEMANTIC_TOKEN_MODIFIERS = [
-  "declaration",
-  "definition",
-  "readonly",
-  "static",
-  "deprecated",
-  "abstract",
-  "async",
-  "modification",
-  "documentation",
-  "defaultLibrary",
-];
-
 function logMessage(connection, type, message) {
   connection.notify("window/logMessage", { type, message });
 }
@@ -625,90 +586,6 @@ function createTemplateCompletionItems() {
   ];
 }
 
-function decodeSemanticTokens(data) {
-  const tokens = [];
-  let line = 0;
-  let character = 0;
-
-  for (let index = 0; index < data.length; index += 5) {
-    line += data[index];
-    character = data[index] === 0 ? character + data[index + 1] : data[index + 1];
-    tokens.push({
-      line,
-      character,
-      length: data[index + 2],
-      tokenType: data[index + 3],
-      tokenModifiers: data[index + 4],
-    });
-  }
-  return tokens;
-}
-
-function encodeSemanticTokens(tokens) {
-  const data = [];
-  let previousLine = 0;
-  let previousCharacter = 0;
-
-  for (const token of tokens) {
-    const deltaLine = token.line - previousLine;
-    const deltaStart = deltaLine === 0 ? token.character - previousCharacter : token.character;
-    data.push(deltaLine, deltaStart, token.length, token.tokenType, token.tokenModifiers);
-    previousLine = token.line;
-    previousCharacter = token.character;
-  }
-
-  return data;
-}
-
-function remapSemanticTokens(result, doc, hostLegend) {
-  if (!result || !Array.isArray(result.data) || !hostLegend) {
-    return result;
-  }
-
-  const typeMap = new Map();
-  for (let index = 0; index < (hostLegend.tokenTypes || []).length; index += 1) {
-    const name = hostLegend.tokenTypes[index];
-    const targetIndex = COMMON_SEMANTIC_TOKEN_TYPES.indexOf(name);
-    typeMap.set(index, targetIndex === -1 ? COMMON_SEMANTIC_TOKEN_TYPES.indexOf("variable") : targetIndex);
-  }
-
-  const modifierMap = new Map();
-  for (let index = 0; index < (hostLegend.tokenModifiers || []).length; index += 1) {
-    const name = hostLegend.tokenModifiers[index];
-    const targetIndex = COMMON_SEMANTIC_TOKEN_MODIFIERS.indexOf(name);
-    if (targetIndex !== -1) {
-      modifierMap.set(index, targetIndex);
-    }
-  }
-
-  const tokens = decodeSemanticTokens(result.data)
-    .filter((token) => {
-      const range = {
-        start: { line: token.line, character: token.character },
-        end: { line: token.line, character: token.character + token.length },
-      };
-      return !rangeOverlapsSpans(doc.text, range, doc.spans);
-    })
-    .map((token) => {
-      let modifiers = 0;
-      for (const [source, target] of modifierMap.entries()) {
-        if ((token.tokenModifiers & (1 << source)) !== 0) {
-          modifiers |= 1 << target;
-        }
-      }
-      return {
-        ...token,
-        tokenType: typeMap.get(token.tokenType) ?? COMMON_SEMANTIC_TOKEN_TYPES.indexOf("variable"),
-        tokenModifiers: modifiers,
-      };
-    });
-
-  return {
-    ...result,
-    data: encodeSemanticTokens(tokens),
-  };
-}
-
 class TemplateDocument {
   constructor(uri, version, text, proxy) {
     this.uri = uri;
@@ -746,7 +623,6 @@ class HostClient {
     this.started = false;
     this.failed = null;
     this.startPromise = null;
-    this.semanticTokensLegend = null;
   }
 
   async start() {
@@ -802,7 +678,6 @@ class HostClient {
       initializationOptions: this.config.initializationOptions ?? {},
     });
 
-    this.semanticTokensLegend = initializeResult?.capabilities?.semanticTokensProvider?.legend ?? null;
     this.connection.notify("initialized", {});
     this.started = true;
   }
@@ -920,8 +795,6 @@ class ChezmoiProxy {
       case "textDocument/rename":
       case "textDocument/prepareRename":
         return this.forwardDocumentRequest(method, params);
-      case "textDocument/semanticTokens/full":
-        return this.forwardSemanticTokensRequest(method, params);
       default:
         return null;
     }
@@ -983,13 +856,6 @@ class ChezmoiProxy {
         documentRangeFormattingProvider: true,
         codeActionProvider: true,
         renameProvider: { prepareProvider: true },
-        semanticTokensProvider: {
-          legend: {
-            tokenTypes: COMMON_SEMANTIC_TOKEN_TYPES,
-            tokenModifiers: COMMON_SEMANTIC_TOKEN_MODIFIERS,
-          },
-          full: true,
-        },
       },
       serverInfo: {
         name: "chezmoi-lsp",
@@ -1162,20 +1028,6 @@ class ChezmoiProxy {
     return filterAndRewriteResponse(response, doc) ?? null;
   }
 
-  async forwardSemanticTokensRequest(method, params) {
-    const uri = params?.textDocument?.uri;
-    const doc = uri ? this.documents.get(uri) : null;
-    if (!doc) {
-      return { data: [] };
-    }
-    const client = await this.ensureHostDocument(doc, false);
-    if (!client) {
-      return { data: [] };
-    }
-    const response = await client.request(method, rewriteRequestParamsForHost(params, doc));
-    return remapSemanticTokens(response, doc, client.semanticTokensLegend) ?? { data: [] };
-  }
-
   async forwardDocumentNotification(method, params) {
     const uri = params?.textDocument?.uri;
     const doc = uri ? this.documents.get(uri) : null;
@@ -1202,8 +1054,6 @@ if (require.main === module) {
 
 module.exports = {
   applyContentChanges,
-  decodeSemanticTokens,
-  encodeSemanticTokens,
   filterAndRewriteResponse,
   findTemplateSpans,
   hostUriForTemplateUri,
@@ -1213,7 +1063,6 @@ module.exports = {
   offsetAtPosition,
   positionAtOffset,
   rangeOverlapsSpans,
-  remapSemanticTokens,
   shouldSuppressHostError,
   templateDiagnostics,
 };
