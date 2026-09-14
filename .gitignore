@@ -7,3 +7,7 @@ yarn-error.log*
 pnpm-debug.log*
 /grammars/**/node_modules
 /grammars/**/target
+
+# Zed clones and builds grammars here during a dev install.
+/grammars/
+/extension.wasm

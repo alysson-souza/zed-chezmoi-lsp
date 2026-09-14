@@ -188,6 +188,15 @@ function stripChezmoiSourcePrefixes(fileName) {
       "create_",
       "modify_",
       "remove_",
+      "symlink_",
+      "exact_",
+      "external_",
+      "run_",
+      "once_",
+      "onchange_",
+      "before_",
+      "after_",
+      "empty_",
     ]) {
       if (normalized.startsWith(prefix)) {
         normalized = normalized.slice(prefix.length);
@@ -196,6 +205,10 @@ function stripChezmoiSourcePrefixes(fileName) {
     }
   }
 
+  // `literal_` stops attribute parsing; whatever follows is the real name.
+  if (normalized.startsWith("literal_")) {
+    return normalized.slice("literal_".length);
+  }
   if (normalized.startsWith("dot_")) {
     normalized = `.${normalized.slice("dot_".length)}`;
   }
@@ -218,6 +231,16 @@ function hostNameCandidates(fileName) {
   return [...new Set(candidates.map((candidate) => candidate.toLowerCase()))];
 }
 
+// What a bare `{{ .value }}` becomes in the masked text, per host language, so
+// the host sees a syntactically complete document instead of a missing value.
+// Shell-like hosts tolerate the empty space and get no filler.
+const DEFAULT_VALUE_FILLERS = {
+  json: "null",
+  jsonc: "null",
+  yaml: "null",
+  toml: "\"\"",
+};
+
 function normalizeHostLanguages(raw) {
   const result = {};
   if (!raw || typeof raw !== "object") {
@@ -235,6 +258,12 @@ function normalizeHostLanguages(raw) {
         ? config.language_id
         : suffix;
 
+    const valueFiller = typeof config.valueFiller === "string"
+      ? config.valueFiller
+      : typeof config.value_filler === "string"
+        ? config.value_filler
+        : DEFAULT_VALUE_FILLERS[languageId] ?? "";
+
     result[suffix.toLowerCase()] = {
       languageId,
       command,
@@ -242,12 +271,71 @@ function normalizeHostLanguages(raw) {
       env: config.env && typeof config.env === "object" ? config.env : {},
       initializationOptions: config.initializationOptions ?? config.initialization_options,
       settings: config.settings,
+      valueFiller,
     };
   }
   return result;
 }
 
-function inferHostKey(uri, hostLanguages) {
+// Interpreter names a shebang can carry, mapped to the hostLanguages keys that
+// serve them. A shebang means the file is a script whatever its name says, as
+// with chezmoi `modify_` scripts named after the file they rewrite.
+const SHEBANG_HOST_KEYS = {
+  fish: ["fish"],
+  bash: ["bash", "sh", "shellscript"],
+  sh: ["sh", "bash", "shellscript"],
+  zsh: ["zsh", "bash", "sh", "shellscript"],
+  python: ["py", "python"],
+  python3: ["py", "python"],
+  node: ["js", "javascript"],
+};
+
+// The first line that is not blank once template actions are removed, so a
+// shebang still counts when variable declarations precede it.
+function firstContentLine(text) {
+  const masked = maskTemplateSpans(text);
+  let offset = 0;
+  while (offset < masked.length) {
+    const lineEnd = masked.indexOf("\n", offset) === -1 ? masked.length : masked.indexOf("\n", offset);
+    if (masked.slice(offset, lineEnd).trim() !== "") {
+      return text.slice(offset, lineEnd);
+    }
+    offset = lineEnd + 1;
+  }
+  return "";
+}
+
+function shebangHostKey(text, hostLanguages) {
+  if (typeof text !== "string") {
+    return null;
+  }
+  const line = firstContentLine(text).trimStart();
+  if (!line.startsWith("#!")) {
+    return null;
+  }
+  const firstLine = line.slice(2).trim();
+  const words = firstLine.split(/\s+/).filter(Boolean);
+  let interpreter = words[0] ? path.basename(words[0]) : "";
+  if (interpreter === "env") {
+    interpreter = words.slice(1).find((word) => !word.startsWith("-")) || "";
+    interpreter = path.basename(interpreter);
+  }
+  const base = interpreter.replace(/[0-9.]+$/, "") || interpreter;
+  if (!base) {
+    return null;
+  }
+  const candidates = [interpreter, ...(SHEBANG_HOST_KEYS[interpreter] || SHEBANG_HOST_KEYS[base] || []), base];
+  // A script with no configured host gets its interpreter as key, which maps
+  // to no server; the file name must not route it to a data-format server.
+  return candidates.find((key) => Object.prototype.hasOwnProperty.call(hostLanguages || {}, key)) || base;
+}
+
+function inferHostKey(uri, hostLanguages, text) {
+  const fromShebang = shebangHostKey(text, hostLanguages);
+  if (fromShebang) {
+    return fromShebang;
+  }
+
   const withoutTemplateSuffix = hostUriForTemplateUri(pathFromUri(uri));
   const normalizedPath = withoutTemplateSuffix.toLowerCase();
   const fileNames = hostNameCandidates(fileNameFromUri(withoutTemplateSuffix));
@@ -287,6 +375,53 @@ function shouldSuppressHostError(error) {
     || /No host LSP command configured/.test(message);
 }
 
+// Offset of the `}}` that closes an action whose body starts at `from`, or -1.
+// A `}}` inside a quoted string, a backtick raw string, or a comment does not
+// close the action, so the search has to walk the body the way the parser would.
+function findActionEnd(text, from) {
+  let index = from;
+  if (text.startsWith("-", index)) {
+    index += 1;
+  }
+  while (index < text.length && (text[index] === " " || text[index] === "\t")) {
+    index += 1;
+  }
+  if (text.startsWith("/*", index)) {
+    const close = text.indexOf("*/", index + 2);
+    if (close === -1) {
+      return -1;
+    }
+    index = close + 2;
+  }
+
+  while (index < text.length) {
+    const char = text[index];
+    if (char === "}" && text[index + 1] === "}") {
+      return index;
+    }
+    if (char === "\"" || char === "'") {
+      index += 1;
+      while (index < text.length && text[index] !== char) {
+        if (text[index] === "\\") {
+          index += 1;
+        }
+        if (text[index] === "\n") {
+          break;
+        }
+        index += 1;
+      }
+    } else if (char === "`") {
+      const close = text.indexOf("`", index + 1);
+      if (close === -1) {
+        return -1;
+      }
+      index = close;
+    }
+    index += 1;
+  }
+  return -1;
+}
+
 function findTemplateSpans(text) {
   const spans = [];
   let index = 0;
@@ -297,7 +432,7 @@ function findTemplateSpans(text) {
       break;
     }
 
-    const endMarker = text.indexOf("}}", start + 2);
+    const endMarker = findActionEnd(text, start + 2);
     if (endMarker === -1) {
       spans.push({
         start,
@@ -321,16 +456,85 @@ function findTemplateSpans(text) {
   return spans;
 }
 
-function maskTemplateSpans(text, spans = findTemplateSpans(text)) {
+const CONTROL_KEYWORDS = new Set(["if", "else", "end", "range", "with", "define", "block", "template", "break", "continue"]);
+
+// True when the action produces output in place, as opposed to steering
+// control flow or holding a comment.
+function isValueAction(span) {
+  if (span.unclosed) {
+    return false;
+  }
+  const content = normalizeActionContent(span.content);
+  if (content === "" || content.startsWith("/*")) {
+    return false;
+  }
+  // Variable declarations and assignments print nothing.
+  if (/^\$[A-Za-z0-9_]*\s*:?=/.test(content)) {
+    return false;
+  }
+  const keyword = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(content)?.[1];
+  return !CONTROL_KEYWORDS.has(keyword);
+}
+
+// True when an odd number of unescaped quotes precede the offset on its line,
+// which is enough to keep a filler out of single-line string literals.
+function insideQuotedString(text, offset) {
+  const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
+  let doubles = 0;
+  let singles = 0;
+  for (let index = lineStart; index < offset; index += 1) {
+    const char = text[index];
+    if (char === "\\") {
+      index += 1;
+    } else if (char === "\"" && singles % 2 === 0) {
+      doubles += 1;
+    } else if (char === "'" && doubles % 2 === 0) {
+      singles += 1;
+    }
+  }
+  return doubles % 2 === 1 || singles % 2 === 1;
+}
+
+function maskTemplateSpans(text, spans = findTemplateSpans(text), options = {}) {
   const chars = text.split("");
+  const filler = typeof options.valueFiller === "string" ? options.valueFiller : "";
   for (const span of spans) {
+    const multiline = text.slice(span.start, span.end).includes("\n");
+    // An action followed by `:` or `=` on its line stands in for a key, where
+    // the value filler would not parse; an empty quoted key does.
+    const rest = /^[ \t]*([:=])/.exec(text.slice(span.end, text.indexOf("\n", span.end) === -1 ? text.length : text.indexOf("\n", span.end)));
+    const chosen = rest ? "\"\"" : filler;
+    const fill = chosen
+      && chosen.length <= span.end - span.start
+      && !multiline
+      && isValueAction(span)
+      && !insideQuotedString(text, span.start);
     for (let index = span.start; index < span.end; index += 1) {
       if (chars[index] !== "\n" && chars[index] !== "\r") {
-        chars[index] = " ";
+        const fillIndex = index - span.start;
+        chars[index] = fill && fillIndex < chosen.length ? chosen[fillIndex] : " ";
       }
     }
   }
   return chars.join("");
+}
+
+// Lines holding a control action (if, range, end, ...). Host syntax errors on
+// those lines are artifacts of the masked hole, such as a comma the template
+// emits conditionally, so host diagnostics starting there are dropped.
+function controlActionLines(text, spans = findTemplateSpans(text)) {
+  const lines = new Set();
+  for (const span of spans) {
+    if (isValueAction(span)) {
+      continue;
+    }
+    const first = positionAtOffset(text, span.start).line;
+    const last = positionAtOffset(text, Math.max(span.start, span.end - 1)).line;
+    for (let line = first; line <= last; line += 1) {
+      lines.add(line);
+    }
+  }
+  return lines;
 }
 
 function lineOffsets(text) {
@@ -372,18 +576,25 @@ function positionAtOffset(text, offset) {
   return { line: 0, character: clipped };
 }
 
+// Spans are half-open: `start` is the first `{` and `end` is the first offset
+// of host text after `}}`. A point sits inside a span only strictly between
+// those, so a cursor right before `{{` or right after `}}` belongs to the host.
+function offsetInsideSpan(offset, span) {
+  return offset > span.start && offset < span.end;
+}
+
 function rangeOverlapsSpans(text, range, spans) {
   const start = offsetAtPosition(text, range.start);
   const end = offsetAtPosition(text, range.end);
   if (start === end) {
-    return spans.some((span) => start >= span.start && start <= span.end);
+    return spans.some((span) => offsetInsideSpan(start, span));
   }
   return spans.some((span) => start < span.end && end > span.start);
 }
 
 function positionInsideSpan(text, position, spans) {
   const offset = offsetAtPosition(text, position);
-  return spans.some((span) => offset >= span.start && offset <= span.end);
+  return spans.some((span) => offsetInsideSpan(offset, span));
 }
 
 function normalizeActionContent(raw) {
@@ -471,10 +682,21 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function filterAndRewriteResponse(value, doc) {
+// A symbol (DocumentSymbol or SymbolInformation) whose range encloses a
+// template action is still a real symbol; only its name position matters.
+function isSymbol(value) {
+  return typeof value.name === "string" && typeof value.kind === "number"
+    && (value.selectionRange || value.location);
+}
+
+// Rewrites host URIs back to the template URI and drops results that fall
+// inside a template action. `scope` says which file the ranges belong to when
+// an object carries no uri of its own; only ranges in this document are
+// filtered, never those in other files.
+function filterAndRewriteResponse(value, doc, scope = doc.hostUri, keep = false) {
   if (Array.isArray(value)) {
     return value
-      .map((item) => filterAndRewriteResponse(item, doc))
+      .map((item) => filterAndRewriteResponse(item, doc, scope, keep))
       .filter((item) => item !== undefined);
   }
 
@@ -482,25 +704,35 @@ function filterAndRewriteResponse(value, doc) {
     return value;
   }
 
-  if (value.uri === doc.hostUri && value.range && rangeOverlapsSpans(doc.text, value.range, doc.spans)) {
-    return undefined;
+  if (isSymbol(value)) {
+    // SymbolInformation has no selectionRange; its name sits where the range starts.
+    const anchor = value.selectionRange
+      || (value.location?.range ? { start: value.location.range.start, end: value.location.range.start } : null);
+    const anchorUri = value.location?.uri ?? scope;
+    if (anchor && anchorUri === doc.hostUri && rangeOverlapsSpans(doc.text, anchor, doc.spans)) {
+      return undefined;
+    }
+    keep = true;
   }
 
-  if (value.targetUri === doc.hostUri && value.targetRange && rangeOverlapsSpans(doc.text, value.targetRange, doc.spans)) {
-    return undefined;
-  }
+  if (!keep) {
+    if (value.uri === doc.hostUri && value.range && rangeOverlapsSpans(doc.text, value.range, doc.spans)) {
+      return undefined;
+    }
 
-  if (value.range && !value.uri && rangeOverlapsSpans(doc.text, value.range, doc.spans)) {
-    return undefined;
+    if (value.targetUri === doc.hostUri && value.targetRange && rangeOverlapsSpans(doc.text, value.targetRange, doc.spans)) {
+      return undefined;
+    }
+
+    if (value.range && !value.uri && !value.targetUri && scope === doc.hostUri
+      && rangeOverlapsSpans(doc.text, value.range, doc.spans)) {
+      return undefined;
+    }
   }
 
   const next = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === "uri" && child === doc.hostUri) {
-      next[key] = doc.uri;
-      continue;
-    }
-    if (key === "targetUri" && child === doc.hostUri) {
+    if ((key === "uri" || key === "targetUri") && child === doc.hostUri) {
       next[key] = doc.uri;
       continue;
     }
@@ -508,16 +740,28 @@ function filterAndRewriteResponse(value, doc) {
       const changes = {};
       for (const [uri, edits] of Object.entries(child)) {
         const rewrittenUri = uri === doc.hostUri ? doc.uri : uri;
-        const rewrittenEdits = filterAndRewriteResponse(edits, doc);
-        if (Array.isArray(rewrittenEdits) && rewrittenEdits.length > 0) {
-          changes[rewrittenUri] = rewrittenEdits;
-        }
+        changes[rewrittenUri] = filterAndRewriteResponse(edits, doc, uri);
       }
       next[key] = changes;
       continue;
     }
+    if (key === "documentChanges" && Array.isArray(child)) {
+      next[key] = child.map((change) => {
+        const changeUri = change?.textDocument?.uri;
+        return changeUri ? filterAndRewriteResponse(change, doc, changeUri) : filterAndRewriteResponse(change, doc, null);
+      });
+      continue;
+    }
+    if (key === "children" && Array.isArray(child)) {
+      next[key] = filterAndRewriteResponse(child, doc, scope, false);
+      continue;
+    }
+    if (key === "location" && keep) {
+      next[key] = filterAndRewriteResponse(child, doc, scope, true);
+      continue;
+    }
 
-    const rewritten = filterAndRewriteResponse(child, doc);
+    const rewritten = filterAndRewriteResponse(child, doc, scope, keep);
     if (rewritten !== undefined) {
       next[key] = rewritten;
     }
@@ -599,10 +843,11 @@ class TemplateDocument {
 
   refresh() {
     this.hostUri = hostUriForTemplateUri(this.uri);
-    this.hostKey = inferHostKey(this.uri, this.proxy.hostLanguages);
+    this.hostKey = inferHostKey(this.uri, this.proxy.hostLanguages, this.text);
     this.hostConfig = this.proxy.hostLanguages[this.hostKey] || this.proxy.hostLanguages["*"] || null;
     this.spans = findTemplateSpans(this.text);
-    this.maskedText = maskTemplateSpans(this.text, this.spans);
+    this.maskedText = maskTemplateSpans(this.text, this.spans, { valueFiller: this.hostConfig?.valueFiller });
+    this.controlLines = controlActionLines(this.text, this.spans);
     this.templateDiagnostics = templateDiagnostics(this.text, this.spans);
   }
 
@@ -623,9 +868,25 @@ class HostClient {
     this.started = false;
     this.failed = null;
     this.startPromise = null;
+    this.restarts = 0;
   }
 
+  static get MAX_RESTARTS() {
+    return 3;
+  }
+
+  // A host that died is started again on the next use, up to a small budget,
+  // so one crash does not switch the language off for the rest of the session.
+  // A host that cannot be spawned at all stays off: nothing will change that.
   async start() {
+    if (this.failed && !shouldSuppressHostError(this.failed) && this.restarts < HostClient.MAX_RESTARTS) {
+      this.restarts += 1;
+      this.failed = null;
+      this.startPromise = null;
+      this.started = false;
+      this.documents.clear();
+      this.hostUriToSourceUri.clear();
+    }
     if (this.failed) {
       throw this.failed;
     }
@@ -655,15 +916,16 @@ class HostClient {
       if (this.connection) {
         this.connection.failAll(error);
       }
-      this.proxy.markHostFailed(this.key, error);
+      this.proxy.markHostFailed(this, error);
     });
     child.on("exit", (code, signal) => {
       const error = new Error(`Host LSP '${this.key}' exited with code ${code ?? "null"} signal ${signal ?? "null"}`);
       this.failed = error;
+      this.started = false;
       if (this.connection) {
         this.connection.failAll(error);
       }
-      this.proxy.markHostFailed(this.key, error);
+      this.proxy.markHostFailed(this, error);
     });
 
     this.connection = new JsonRpcPeer(child.stdout, child.stdin, `host:${this.key}`);
@@ -682,9 +944,24 @@ class HostClient {
     this.started = true;
   }
 
-  async handleHostRequest(method) {
+  async handleHostRequest(method, params) {
     if (method === "workspace/configuration") {
-      return this.config.settings ? [this.config.settings] : [];
+      // One entry per requested item, scoped to its section when we have one.
+      const items = Array.isArray(params?.items) ? params.items : [];
+      const settings = this.config.settings;
+      return items.map((item) => {
+        if (!settings || typeof settings !== "object") {
+          return null;
+        }
+        if (typeof item?.section === "string" && item.section !== "") {
+          let node = settings;
+          for (const part of item.section.split(".")) {
+            node = node && typeof node === "object" ? node[part] : undefined;
+          }
+          return node ?? null;
+        }
+        return settings;
+      });
     }
     if (method === "client/registerCapability" || method === "client/unregisterCapability") {
       return null;
@@ -708,7 +985,9 @@ class HostClient {
     }
 
     const diagnostics = (params.diagnostics || [])
-      .filter((diagnostic) => diagnostic.range && !rangeOverlapsSpans(doc.text, diagnostic.range, doc.spans))
+      .filter((diagnostic) => diagnostic.range
+        && !rangeOverlapsSpans(doc.text, diagnostic.range, doc.spans)
+        && !doc.controlLines.has(diagnostic.range.start.line))
       .map((diagnostic) => ({
         ...diagnostic,
         source: diagnostic.source || `${this.key}-lsp`,
@@ -736,6 +1015,9 @@ class HostClient {
 
   async changeDocument(doc) {
     await this.openDocument(doc);
+    if (this.documents.get(doc.uri) === doc.version) {
+      return;
+    }
     this.documents.set(doc.uri, doc.version);
     this.connection.notify("textDocument/didChange", {
       textDocument: { uri: doc.hostUri, version: doc.version },
@@ -779,6 +1061,7 @@ class ChezmoiProxy {
       case "initialize":
         return this.initialize(params);
       case "shutdown":
+        await this.shutdownHosts();
         return null;
       case "textDocument/completion":
       case "textDocument/hover":
@@ -789,8 +1072,6 @@ class ChezmoiProxy {
       case "textDocument/references":
       case "textDocument/documentHighlight":
       case "textDocument/documentSymbol":
-      case "textDocument/formatting":
-      case "textDocument/rangeFormatting":
       case "textDocument/codeAction":
       case "textDocument/rename":
       case "textDocument/prepareRename":
@@ -805,6 +1086,7 @@ class ChezmoiProxy {
       case "initialized":
         return;
       case "exit":
+        this.killHosts();
         process.exit(0);
         return;
       case "textDocument/didOpen":
@@ -852,16 +1134,42 @@ class ChezmoiProxy {
         referencesProvider: true,
         documentHighlightProvider: true,
         documentSymbolProvider: true,
-        documentFormattingProvider: true,
-        documentRangeFormattingProvider: true,
+        // Formatting is not offered: the host would format the masked text and
+        // hand back edits that overwrite template actions with blanks.
         codeActionProvider: true,
         renameProvider: { prepareProvider: true },
       },
       serverInfo: {
         name: "chezmoi-lsp",
-        version: "0.1.0",
+        version: "0.2.0",
       },
     };
+  }
+
+  // Hosts are told to shut down with the proxy so no server outlives its editor.
+  async shutdownHosts() {
+    await Promise.all([...this.hostClients.values()].map(async (client) => {
+      if (!client.started || client.failed) {
+        return;
+      }
+      try {
+        await Promise.race([
+          client.request("shutdown", null),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+        client.notify("exit", null);
+      } catch {
+        // The host is on its way out either way.
+      }
+    }));
+  }
+
+  killHosts() {
+    for (const client of this.hostClients.values()) {
+      if (client.child && client.child.exitCode === null) {
+        client.child.kill();
+      }
+    }
   }
 
   updateConfiguration(settings = {}) {
@@ -922,9 +1230,12 @@ class ChezmoiProxy {
     });
   }
 
-  markHostFailed(hostKey, error) {
+  // Matched by client instance, not by language key: a host replaced after a
+  // configuration change must not report its death against the new one.
+  markHostFailed(client, error) {
+    const hostKey = client.key;
     for (const doc of this.documents.values()) {
-      if (doc.hostKey === hostKey) {
+      if (client.documents.has(doc.uri) || this.hostClientForDoc(doc) === client) {
         if (shouldSuppressHostError(error)) {
           doc.hostDiagnostics = [];
           doc.hostStatusDiagnostics = [];
@@ -1036,7 +1347,12 @@ class ChezmoiProxy {
     }
     const client = await this.ensureHostDocument(doc, false);
     if (client) {
-      client.notify(method, rewriteRequestParamsForHost(params, doc));
+      const hostParams = rewriteRequestParamsForHost(params, doc);
+      if (typeof hostParams.text === "string") {
+        // didSave may carry the document; the host only ever sees masked text.
+        hostParams.text = doc.maskedText;
+      }
+      client.notify(method, hostParams);
     }
   }
 }
@@ -1046,6 +1362,12 @@ function main() {
   const proxy = new ChezmoiProxy(connection);
   connection.onRequest = (method, params) => proxy.handleRequest(method, params);
   connection.onNotification = (method, params) => proxy.handleNotification(method, params);
+  // A client that dies without `exit` closes stdin; follow it down rather than
+  // idling with the host servers still running.
+  process.stdin.on("close", () => {
+    proxy.killHosts();
+    process.exit(0);
+  });
 }
 
 if (require.main === module) {
@@ -1062,7 +1384,9 @@ module.exports = {
   normalizeHostLanguages,
   offsetAtPosition,
   positionAtOffset,
+  positionInsideSpan,
   rangeOverlapsSpans,
   shouldSuppressHostError,
   templateDiagnostics,
+  controlActionLines,
 };
