@@ -18,6 +18,8 @@ const {
   rangeOverlapsSpans,
   shouldSuppressHostError,
   templateDiagnostics,
+  positionInsideSpan: positionInsideSpanExport,
+  controlActionLines,
 } = require("./chezmoi-lsp");
 
 function configPath(...parts) {
@@ -179,4 +181,168 @@ test("shouldSuppressHostError hides missing optional host servers", () => {
   assert.equal(shouldSuppressHostError(new Error("spawn taplo ENOENT")), true);
   assert.equal(shouldSuppressHostError(new Error("No host LSP command configured for suffix 'conf'")), true);
   assert.equal(shouldSuppressHostError(new Error("Host LSP 'toml' exited with code 1 signal null")), false);
+});
+
+test("inferHostKey prefers a shebang over the target file name", () => {
+  const hostLanguages = normalizeHostLanguages({
+    fish: { languageId: "fish", command: "fish-lsp", args: ["start"] },
+    json: { languageId: "json", command: "vscode-json-language-server" },
+    py: { languageId: "python", command: "pylsp" },
+    sh: { languageId: "shellscript", command: "bash-language-server" },
+  });
+
+  assert.equal(inferHostKey("file:///s/modify_private_settings.json.tmpl", hostLanguages, "#!/usr/bin/env fish\nset -l x 1\n"), "fish");
+  assert.equal(inferHostKey("file:///s/modify_private_config.toml.tmpl", hostLanguages, "#!/usr/bin/env python3\n"), "py");
+  assert.equal(inferHostKey("file:///s/run_once_install.tmpl", hostLanguages, "#!/bin/bash\n"), "sh");
+  assert.equal(inferHostKey("file:///s/config.fish.tmpl", hostLanguages, "# no shebang\n"), "fish");
+  assert.equal(inferHostKey("file:///s/settings.json.tmpl", hostLanguages, "{\n  \"a\": \"{{ .x }}\"\n}\n"), "json");
+});
+
+test("maskTemplateSpans fills bare value actions with a host placeholder", () => {
+  const text = "{\n  \"a\": {{ .x }},\n  \"b\": \"{{ .y }}\",\n{{ if .z }}\n  \"c\": {{- .w -}}\n{{ end }}\n}\n";
+  const masked = maskTemplateSpans(text, findTemplateSpans(text), { valueFiller: "null" });
+
+  assert.equal(masked.length, text.length);
+  assert.equal(masked.split("\n").length, text.split("\n").length);
+  const lines = masked.split("\n");
+  assert.equal(lines[1], "  \"a\": null    ,");
+  assert.equal(lines[2], "  \"b\": \"        \",");
+  assert.equal(lines[3], "           ");
+  assert.equal(lines[4], "  \"c\": null      ");
+  assert.equal(lines[5], "         ");
+  assert.equal(maskTemplateSpans(text), maskTemplateSpans(text, findTemplateSpans(text), {}));
+});
+
+test("maskTemplateSpans keeps a filler that does not fit as spaces", () => {
+  const text = "a: {{.x}}\n";
+  assert.equal(maskTemplateSpans(text, findTemplateSpans(text), { valueFiller: "nullish" }), "a:       \n");
+});
+
+test("maskTemplateSpans never fills actions that print nothing", () => {
+  const text = "{{- $cfg := .mcp -}}\n{{- $n = 1 -}}\n{{- /* note */ -}}\n{{ template \"x\" . }}\n{ \"a\": {{ $cfg.url | quote }} }\n";
+  const masked = maskTemplateSpans(text, findTemplateSpans(text), { valueFiller: "null" });
+  const lines = masked.split("\n");
+  assert.equal(lines[0].trim(), "");
+  assert.equal(lines[1].trim(), "");
+  assert.equal(lines[2].trim(), "");
+  assert.equal(lines[3].trim(), "");
+  assert.equal(lines[4], "{ \"a\": null                   }");
+});
+
+test("maskTemplateSpans uses an empty quoted key for actions in key position", () => {
+  const text = "{\n  {{ $name }}: { \"v\": {{ .v }} },\n  \"{{ .k }}\": 1\n}\n";
+  const masked = maskTemplateSpans(text, findTemplateSpans(text), { valueFiller: "null" });
+  assert.equal(masked.split("\n")[1], "  \"\"         : { \"v\": null     },");
+  assert.equal(masked.split("\n")[2], "  \"        \": 1");
+  assert.doesNotThrow(() => JSON.parse(masked));
+  assert.equal(maskTemplateSpans("{{ $k }} = 1\n", undefined, { valueFiller: "\"\"" }), "\"\"       = 1\n");
+});
+
+test("findTemplateSpans ignores `}}` inside strings, raw strings and comments", () => {
+  const cases = [
+    ["a {{ \"}}\" }} b", 2, 12],
+    ["a {{ printf \"x }} y\" }} b", 2, 23],
+    ["a {{ printf `x }} y` }} b", 2, 23],
+    ["a {{/* see }} here */}} b", 2, 23],
+    ["a {{- /* }} */ -}} b", 2, 18],
+    ["a {{ 'q}}' }} b", 2, 13],
+  ];
+  for (const [text, start, end] of cases) {
+    const spans = findTemplateSpans(text);
+    assert.deepEqual(spans.map((span) => [span.start, span.end, span.unclosed]), [[start, end, false]], text);
+    assert.equal(maskTemplateSpans(text).includes("}}"), false, text);
+  }
+  const unclosed = findTemplateSpans("a {{ \"}}\" ");
+  assert.equal(unclosed.length, 1);
+  assert.equal(unclosed[0].unclosed, true);
+});
+
+test("positions right before `{{` and right after `}}` belong to the host", () => {
+  const text = "foo{{ .bar }}baz";
+  const spans = findTemplateSpans(text);
+  assert.equal(positionInsideSpanExport(text, { line: 0, character: 3 }, spans), false);
+  assert.equal(positionInsideSpanExport(text, { line: 0, character: 4 }, spans), true);
+  assert.equal(positionInsideSpanExport(text, { line: 0, character: 12 }, spans), true);
+  assert.equal(positionInsideSpanExport(text, { line: 0, character: 13 }, spans), false);
+  assert.equal(rangeOverlapsSpans(text, { start: { line: 0, character: 13 }, end: { line: 0, character: 13 } }, spans), false);
+  assert.equal(rangeOverlapsSpans(text, { start: { line: 0, character: 3 }, end: { line: 0, character: 3 } }, spans), false);
+});
+
+test("filterAndRewriteResponse keeps symbols that merely enclose a template action", () => {
+  const text = "function foo\n    {{ if .x }}\n    echo hi\n    {{ end }}\nend\n";
+  const doc = { uri: "file:///r/a.fish.tmpl", hostUri: "file:///r/a.fish", text, spans: findTemplateSpans(text) };
+  const hierarchical = [{
+    name: "foo", kind: 12,
+    range: { start: { line: 0, character: 0 }, end: { line: 4, character: 3 } },
+    selectionRange: { start: { line: 0, character: 9 }, end: { line: 0, character: 12 } },
+    children: [{
+      name: "ghost", kind: 13,
+      range: { start: { line: 1, character: 4 }, end: { line: 1, character: 15 } },
+      selectionRange: { start: { line: 1, character: 7 }, end: { line: 1, character: 9 } },
+    }],
+  }];
+  const result = filterAndRewriteResponse(hierarchical, doc);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].name, "foo");
+  assert.deepEqual(result[0].range, hierarchical[0].range);
+  assert.equal(result[0].children.length, 0);
+
+  const flat = [{ name: "foo", kind: 12, location: { uri: doc.hostUri, range: hierarchical[0].range } }];
+  assert.deepEqual(filterAndRewriteResponse(flat, doc), [{ name: "foo", kind: 12, location: { uri: doc.uri, range: hierarchical[0].range } }]);
+});
+
+test("filterAndRewriteResponse leaves other files' edits alone in workspace edits", () => {
+  const text = "{{ .os }} set -x FOO bar\nfunction greet\nend\n";
+  const doc = { uri: "file:///r/config.fish.tmpl", hostUri: "file:///r/config.fish", text, spans: findTemplateSpans(text) };
+  const edit = (line, a, b) => ({ range: { start: { line, character: a }, end: { line, character: b } }, newText: "x" });
+  const response = {
+    changes: {
+      "file:///r/config.fish": [edit(0, 2, 5), edit(1, 9, 14)],
+      "file:///r/other.fish": [edit(0, 0, 5)],
+    },
+    documentChanges: [
+      { textDocument: { uri: "file:///r/other.fish", version: 1 }, edits: [edit(0, 0, 5)] },
+      { textDocument: { uri: "file:///r/config.fish", version: 1 }, edits: [edit(0, 2, 5), edit(1, 9, 14)] },
+    ],
+  };
+  const result = filterAndRewriteResponse(response, doc);
+  assert.deepEqual(Object.keys(result.changes).sort(), ["file:///r/config.fish.tmpl", "file:///r/other.fish"]);
+  assert.equal(result.changes["file:///r/config.fish.tmpl"].length, 1);
+  assert.equal(result.changes["file:///r/other.fish"].length, 1);
+  assert.equal(result.documentChanges[0].edits.length, 1);
+  assert.equal(result.documentChanges[1].textDocument.uri, doc.uri);
+  assert.equal(result.documentChanges[1].edits.length, 1);
+});
+
+test("inferHostKey sees a shebang below leading template declarations", () => {
+  const hostLanguages = normalizeHostLanguages({
+    fish: { languageId: "fish", command: "fish-lsp", args: ["start"] },
+    json: { languageId: "json", command: "vscode-json-language-server" },
+  });
+  const text = "{{- $mcp := .mcp -}}\n{{- $kagi := printf \"%s\" $mcp.vault -}}\n\n#!/usr/bin/env fish\nset -l x 1\n";
+  assert.equal(inferHostKey("file:///s/modify_private_config.json.tmpl", hostLanguages, text), "fish");
+  assert.equal(inferHostKey("file:///s/config.json.tmpl", hostLanguages, "{{- $x := 1 -}}\n{ \"a\": 1 }\n"), "json");
+});
+
+test("controlActionLines covers lines with control actions but not value actions", () => {
+  const text = "{\n  \"a\": {{ .x }},\n{{- range $i, $m := .list }}{{ if $i }},{{ end }}\n  \"b\": 1\n{{ end }}\n}\n";
+  assert.deepEqual([...controlActionLines(text)].sort(), [2, 4]);
+});
+
+test("inferHostKey strips every chezmoi source attribute prefix", () => {
+  const hostLanguages = normalizeHostLanguages({
+    fish: { languageId: "fish", command: "fish-lsp" },
+    toml: { languageId: "toml", command: "taplo" },
+    zshrc: { languageId: "shellscript", command: "bash-language-server" },
+  });
+  assert.equal(inferHostKey("file:///s/.chezmoiscripts/run_onchange_after_12-setup.fish.tmpl", hostLanguages), "fish");
+  assert.equal(inferHostKey("file:///s/run_once_before_00-clean.fish.tmpl", hostLanguages), "fish");
+  assert.equal(inferHostKey("file:///s/exact_dot_config/symlink_dot_zshrc.tmpl", hostLanguages), "zshrc");
+  assert.equal(inferHostKey("file:///s/literal_run_notes.toml.tmpl", hostLanguages), "toml");
+  assert.equal(inferHostKey("file:///s/.chezmoiexternal.toml.tmpl", hostLanguages), "toml");
+});
+
+test("a script whose interpreter has no host is not routed by file name", () => {
+  const hostLanguages = normalizeHostLanguages({ json: { languageId: "json", command: "vscode-json-language-server" } });
+  assert.equal(inferHostKey("file:///s/modify_settings.json.tmpl", hostLanguages, "#!/usr/bin/env bash\n"), "bash");
 });
