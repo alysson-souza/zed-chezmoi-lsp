@@ -1,7 +1,7 @@
 id = "chezmoi-lsp"
 name = "Chezmoi Templates"
 description = "Chezmoi template support with configurable host language LSP proxying"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 authors = ["Alysson Souza <alysson@ll9.com.br>"]
 repository = "https://github.com/alysson-souza/zed-chezmoi-lsp"
